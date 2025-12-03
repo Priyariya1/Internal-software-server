@@ -68,6 +68,74 @@ CREATE TABLE IF NOT EXISTS project_assignments (
     UNIQUE KEY unique_assignment (project_id, employee_id)
 );
 
+-- ==========================================
+-- QUESTIONNAIRE MODULE TABLES
+-- ==========================================
+
+-- Main questionnaire form
+CREATE TABLE IF NOT EXISTS questionnaires (
+    id VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_by VARCHAR(36) NOT NULL,
+    is_anonymous BOOLEAN DEFAULT FALSE,
+    is_template BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES profiles(id) ON DELETE CASCADE
+);
+
+-- Questions in each questionnaire
+CREATE TABLE IF NOT EXISTS questionnaire_questions (
+    id VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    questionnaire_id VARCHAR(36) NOT NULL,
+    question_text TEXT NOT NULL,
+    question_type ENUM(
+        'short_text', 
+        'long_text', 
+        'multiple_choice', 
+        'checkbox', 
+        'dropdown', 
+        'rating', 
+        'file_upload', 
+        'date'
+    ) NOT NULL,
+    options JSON NULL,   -- For MCQs, dropdowns, checkboxes
+    order_index INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (questionnaire_id) REFERENCES questionnaires(id) ON DELETE CASCADE
+);
+
+-- Form assignments (who receives the form)
+CREATE TABLE IF NOT EXISTS questionnaire_assignments (
+    id VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    questionnaire_id VARCHAR(36) NOT NULL,
+    assigned_to VARCHAR(36),        -- profile_id (employee, manager, etc.)
+    assigned_to_email VARCHAR(255), -- for external clients
+    scheduled_date DATE,
+    status ENUM('assigned', 'completed', 'pending') DEFAULT 'assigned',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (questionnaire_id) REFERENCES questionnaires(id) ON DELETE CASCADE,
+    FOREIGN KEY (assigned_to) REFERENCES profiles(id) ON DELETE SET NULL
+);
+
+-- Responses from users
+CREATE TABLE IF NOT EXISTS questionnaire_responses (
+    id VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    questionnaire_id VARCHAR(36) NOT NULL,
+    responder_id VARCHAR(36) NULL,
+    answers JSON NOT NULL, -- { questionId: "answer value" }
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (questionnaire_id) REFERENCES questionnaires(id) ON DELETE CASCADE,
+    FOREIGN KEY (responder_id) REFERENCES profiles(id) ON DELETE SET NULL
+);
+
+-- Indexes for performance
+CREATE INDEX idx_questionnaires_created_by ON questionnaires(created_by);
+CREATE INDEX idx_questionnaire_assignments_questionnaire_id ON questionnaire_assignments(questionnaire_id);
+CREATE INDEX idx_questionnaire_responses_questionnaire_id ON questionnaire_responses(questionnaire_id);
+
+
 -- Create indexes for better performance
 CREATE INDEX idx_profiles_email ON profiles(email);
 CREATE INDEX idx_user_roles_user_id ON user_roles(user_id);

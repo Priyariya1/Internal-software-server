@@ -11,6 +11,8 @@ import operationsRoutes from './routes/operations.js';
 import analyticsRoutes from './routes/analytics.js';
 import questionnairesRoutes from './routes/questionnaires.js';
 import proposalsRoutes from './routes/proposals.js';
+import adminRoutes from './routes/admin.js';
+import { initSchema } from './models/schema.js';
 
 dotenv.config();
 const app = express();
@@ -29,6 +31,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Test DB
 testConnection();
+initSchema();
 
 // Base route
 app.get('/', (req, res) => {
@@ -60,6 +63,7 @@ app.use('/api/operations', operationsRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/questionnaires', questionnairesRoutes);
 app.use('/api/proposals', proposalsRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -75,15 +79,15 @@ app.get('/api/test-db', async (req, res) => {
   try {
     const pool = await import('./config/database.js');
     const [rows] = await pool.default.execute('SELECT COUNT(*) as count FROM profiles');
-    res.json({ 
-      status: 'Database OK', 
-      profileCount: rows[0].count 
+    res.json({
+      status: 'Database OK',
+      profileCount: rows[0].count
     });
   } catch (error) {
     console.error('Database test error:', error);
-    res.status(500).json({ 
-      error: 'Database error', 
-      message: error.message 
+    res.status(500).json({
+      error: 'Database error',
+      message: error.message
     });
   }
 });
