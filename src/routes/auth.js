@@ -2,6 +2,8 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import { User } from '../models/User.js'; //  Import the User model
 import { authenticateToken } from '../middleware/auth.js';
+import { google } from 'googleapis';
+import pool from '../config/database.js';
 
 const router = express.Router();
 
@@ -306,3 +308,81 @@ router.post('/reset-password', async (req, res) => {
 });
 
 export default router;
+
+// --- Google OAuth Routes ---
+
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+// 1. Initiate Google Login
+router.get('/google', authenticateToken, (req, res) => {
+  const scopes = [
+    'https://www.googleapis.com/auth/forms.body',
+    'https://www.googleapis.com/auth/drive.file'
+  ];
+
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline', // Request refresh token
+    scope: scopes,
+    state: req.user.id // Pass user ID to associate token later
+  });
+
+  res.json({ url });
+});
+
+// 2. Handle Callback
+router.get('/google/callback', async (req, res) => {
+  const { code, state } = req.query; // state contains user_id
+
+  if (!code) {
+    return res.status(400).send('Invalid request: Missing authorization code');
+  }
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+
+    // If state is missing, get user info from Google to find the user
+    let userId = state;
+
+    if (!userId) {
+      // Get user info from Google
+      oauth2Client.setCredentials(tokens);
+      const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+      const { data } = await oauth2.userinfo.get();
+
+      // Find user by email
+      const [users] = await pool.query(
+        'SELECT id FROM profiles WHERE email = ?',
+        [data.email]
+      );
+
+      if (users.length === 0) {
+        return res.status(404).send('User not found. Please ensure you are logged in with the same email.');
+      }
+
+      userId = users[0].id;
+    }
+
+    // Store tokens in database
+    await pool.query(
+      `INSERT INTO oauth_tokens (user_id, access_token, refresh_token, expiry_date) 
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE 
+       access_token = VALUES(access_token), 
+       refresh_token = IF(VALUES(refresh_token) IS NOT NULL, VALUES(refresh_token), refresh_token),
+       expiry_date = VALUES(expiry_date),
+       updated_at = NOW()`,
+      [userId, tokens.access_token, tokens.refresh_token, tokens.expiry_date]
+    );
+
+    // Redirect back to frontend (adjust URL as needed)
+    res.redirect('http://localhost:5173/questionnaires?google_auth=success');
+
+  } catch (error) {
+    console.error('Google Auth Error:', error);
+    res.status(500).send('Authentication failed: ' + error.message);
+  }
+});

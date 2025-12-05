@@ -1,7 +1,10 @@
 import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
 import { authenticateToken, requireRole } from '../middleware/auth.js';
-// ⚠️ ASSUMPTION: This import works and provides a pool/connection object supporting transactions
 import db from '../config/database.js'; // Assuming this provides the database connection pool
+import { google } from 'googleapis';
+import { FormResponse } from '../models/FormResponse.js';
+import { SheetsService } from '../services/sheets.js';
 
 const router = express.Router();
 
@@ -19,14 +22,15 @@ async function createQuestionnaireInDB(questionnaireData, userId) {
     await connection.beginTransaction();
 
     // 2. Insert into 'questionnaires' table
-    const [qResult] = await connection.execute(
-      'INSERT INTO questionnaires (title, description, created_by, purpose) VALUES (?, ?, ?, ?)',
-      [questionnaireData.title, questionnaireData.description, userId, questionnaireData.purpose]
+    const questionnaireId = uuidv4();
+    await connection.execute(
+      'INSERT INTO questionnaires (id, title, description, created_by, purpose) VALUES (?, ?, ?, ?, ?)',
+      [questionnaireId, questionnaireData.title, questionnaireData.description, userId, questionnaireData.purpose]
     );
-    const questionnaireId = qResult.insertId;
 
     // 3. Insert questions with options stored as JSON
-    for (const question of questionnaireData.questions) {
+    for (const [index, question] of questionnaireData.questions.entries()) {
+      const questionId = uuidv4();
       // Prepare options as JSON (or null if no options)
       const optionsJson = question.options && question.options.length > 0
         ? JSON.stringify(question.options)
@@ -34,8 +38,8 @@ async function createQuestionnaireInDB(questionnaireData, userId) {
 
       // Insert into 'questionnaire_questions' with options as JSON
       await connection.execute(
-        'INSERT INTO questionnaire_questions (questionnaire_id, question_text, question_type, options) VALUES (?, ?, ?, ?)',
-        [questionnaireId, question.text, question.type, optionsJson]
+        'INSERT INTO questionnaire_questions (id, questionnaire_id, question_text, question_type, options, order_index) VALUES (?, ?, ?, ?, ?, ?)',
+        [questionId, questionnaireId, question.text, question.type, optionsJson, index]
       );
     }
 
@@ -51,7 +55,7 @@ async function createQuestionnaireInDB(questionnaireData, userId) {
     }
     console.error("DB Transaction Failed:", error);
     // Rethrow the error to be caught by the route handler
-    throw new Error('Database transaction failed during questionnaire creation.');
+    throw new Error(`Database transaction failed: ${error.message}`);
   } finally {
     // 7. Release the connection back to the pool
     if (connection) {
@@ -70,8 +74,15 @@ router.get('/overview', authenticateToken, requireRole(['admin', 'manager']), as
 
 // GET /api/questionnaires/forms
 router.get('/forms', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
-  // ⚠️ IMPLEMENTATION: Fetch the list of forms from the database
-  res.json({ items: [] });
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, title, description, purpose, created_at, google_form_id, google_form_url FROM questionnaires ORDER BY created_at DESC'
+    );
+    res.json({ items: rows });
+  } catch (error) {
+    console.error('Failed to fetch questionnaires:', error);
+    res.status(500).json({ message: 'Failed to fetch questionnaires.' });
+  }
 });
 
 
@@ -101,6 +112,214 @@ router.post('/forms', authenticateToken, requireRole(['admin', 'manager']), asyn
   }
 });
 
+// POST /api/questionnaires/:id/convert - Convert to Google Form
+router.post('/:id/convert', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+  const userId = req.user.id;
+
+  console.log('=== Convert to Google Form ===');
+  console.log('Questionnaire ID:', questionnaireId);
+  console.log('User ID:', userId);
+
+  try {
+    // 1. Check for Google Token
+    const [tokens] = await db.execute(
+      'SELECT access_token, refresh_token, expiry_date FROM oauth_tokens WHERE user_id = ?',
+      [userId]
+    );
+
+    if (tokens.length === 0) {
+      // No token found, user needs to authenticate
+      // Generate the Google Auth URL directly here
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        process.env.GOOGLE_REDIRECT_URI
+      );
+
+      const scopes = [
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/drive.file'
+      ];
+
+      const url = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: scopes,
+        state: userId
+      });
+
+      return res.status(401).json({
+        message: 'Google authentication required',
+        authUrl: url
+      });
+    }
+
+    const tokenData = tokens[0];
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expiry_date: tokenData.expiry_date
+    });
+
+    // 2. Fetch Questionnaire Data
+    const [questionnaireRows] = await db.execute(
+      'SELECT * FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+    if (questionnaireRows.length === 0) {
+      return res.status(404).json({ message: 'Questionnaire not found' });
+    }
+    const questionnaire = questionnaireRows[0];
+
+    const [questions] = await db.execute(
+      'SELECT * FROM questionnaire_questions WHERE questionnaire_id = ? ORDER BY order_index ASC',
+      [questionnaireId]
+    );
+
+    // 3. Create Google Form (only title allowed on creation)
+    const forms = google.forms({ version: 'v1', auth: oauth2Client });
+
+    const createResponse = await forms.forms.create({
+      requestBody: {
+        info: {
+          title: questionnaire.title
+        }
+      }
+    });
+
+    const formId = createResponse.data.formId;
+    const formUrl = createResponse.data.responderUri;
+
+    // 4. Build batch update requests for description and questions
+    const requests = [];
+
+    // Add description if present
+    if (questionnaire.description) {
+      requests.push({
+        updateFormInfo: {
+          info: {
+            description: questionnaire.description
+          },
+          updateMask: 'description'
+        }
+      });
+    }
+    // Add questions
+
+    for (const q of questions) {
+      const item = {
+        createItem: {
+          item: {
+            title: q.question_text,
+            questionItem: {
+              question: {
+                required: true // Assuming all are required for now, or fetch from DB if column exists
+              }
+            }
+          },
+          location: { index: q.order_index }
+        }
+      };
+
+      // Map types
+      if (q.question_type === 'short_text') {
+        item.createItem.item.questionItem.question.textQuestion = {};
+      } else if (q.question_type === 'long_text') {
+        item.createItem.item.questionItem.question.textQuestion = { paragraph: true };
+      } else if (['multiple_choice', 'checkbox', 'dropdown'].includes(q.question_type)) {
+        let options = [];
+        if (q.options) {
+          if (Array.isArray(q.options)) {
+            // Already an array
+            options = q.options;
+          } else if (typeof q.options === 'string') {
+            try {
+              // Try to parse as JSON first
+              options = JSON.parse(q.options);
+            } catch (e) {
+              // If not JSON, treat as comma-separated string
+              options = q.options.split(',').map(opt => opt.trim()).filter(opt => opt.length > 0);
+            }
+          }
+        }
+        const choiceOptions = options.map(opt => ({ value: opt }));
+
+        item.createItem.item.questionItem.question.choiceQuestion = {
+          type: q.question_type === 'checkbox' ? 'CHECKBOX' : (q.question_type === 'dropdown' ? 'DROP_DOWN' : 'RADIO'),
+          options: choiceOptions
+        };
+      } else if (q.question_type === 'rating') {
+        item.createItem.item.questionItem.question.scaleQuestion = {
+          low: 1,
+          high: 5,
+          lowLabel: 'Low',
+          highLabel: 'High'
+        };
+      }
+
+      requests.push(item);
+    }
+
+    if (requests.length > 0) {
+      await forms.forms.batchUpdate({
+        formId: formId,
+        requestBody: { requests }
+      });
+    }
+
+    console.log('Form created successfully!');
+    console.log('Form ID:', formId);
+    console.log('Form URL:', formUrl);
+
+    // Store the Google Form ID and URL in the database
+    await db.execute(
+      'UPDATE questionnaires SET google_form_id = ?, google_form_url = ? WHERE id = ?',
+      [formId, formUrl, questionnaireId]
+    );
+
+    res.json({ message: 'Form converted successfully', formUrl });
+
+  } catch (error) {
+    console.error('Conversion failed:', error);
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      status: error.status,
+      response: error.response?.data
+    });
+    if (error.code === 401 || (error.response && error.response.status === 401)) {
+      // Regenerate auth URL for re-authentication
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        process.env.GOOGLE_REDIRECT_URI
+      );
+      const scopes = [
+        'https://www.googleapis.com/auth/forms.body',
+        'https://www.googleapis.com/auth/drive.file'
+      ];
+      const url = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: scopes,
+        state: userId
+      });
+
+      return res.status(401).json({
+        message: 'Google token expired or invalid',
+        authUrl: url
+      });
+    }
+    res.status(500).json({ message: 'Failed to convert to Google Form: ' + error.message });
+  }
+});
+
+
 
 // Existing endpoints (placeholders for other functionality)
 router.get('/responses', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
@@ -111,12 +330,368 @@ router.post('/assign', authenticateToken, requireRole(['admin', 'manager']), asy
   res.status(201).json({ id: null, scheduled: false });
 });
 
+// GET /api/questionnaires/forms/:id/responses - Get stored responses from database
 router.get('/forms/:id/responses', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
-  res.json({ items: [] });
+  const questionnaireId = req.params.id;
+
+  try {
+    const responses = await FormResponse.findByQuestionnaireId(questionnaireId);
+    const stats = await FormResponse.getResponseStats(questionnaireId);
+
+    res.json({
+      items: responses,
+      stats: stats,
+      total: responses.length
+    });
+  } catch (error) {
+    console.error('Failed to fetch responses:', error);
+    res.status(500).json({ message: 'Failed to fetch responses from database' });
+  }
 });
 
 router.get('/forms/:id/export', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
   res.json({ url: null, format: req.query.format || 'csv' });
+});
+
+// GET /api/questionnaires/:id/google-responses - Get Google Form Responses (Direct from API)
+router.get('/:id/google-responses', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+  const userId = req.user.id;
+
+  try {
+    // 1. Get the Google Form ID from database
+    const [questionnaireRows] = await db.execute(
+      'SELECT google_form_id, google_form_url, title FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+
+    if (questionnaireRows.length === 0) {
+      return res.status(404).json({ message: 'Questionnaire not found' });
+    }
+
+    const questionnaire = questionnaireRows[0];
+
+    if (!questionnaire.google_form_id) {
+      return res.status(400).json({ message: 'This questionnaire has not been converted to a Google Form yet' });
+    }
+
+    // 2. Get user's Google OAuth token
+    const [tokens] = await db.execute(
+      'SELECT access_token, refresh_token, expiry_date FROM oauth_tokens WHERE user_id = ?',
+      [userId]
+    );
+
+    if (tokens.length === 0) {
+      return res.status(401).json({ message: 'Google authentication required' });
+    }
+
+    const tokenData = tokens[0];
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expiry_date: tokenData.expiry_date
+    });
+
+    // 3. Fetch responses from Google Forms API
+    const forms = google.forms({ version: 'v1', auth: oauth2Client });
+
+    const responsesData = await forms.forms.responses.list({
+      formId: questionnaire.google_form_id
+    });
+
+    res.json({
+      formTitle: questionnaire.title,
+      formUrl: questionnaire.google_form_url,
+      responses: responsesData.data.responses || [],
+      totalResponses: responsesData.data.responses?.length || 0
+    });
+
+  } catch (error) {
+    console.error('Failed to fetch responses:', error);
+    res.status(500).json({ message: 'Failed to fetch form responses: ' + error.message });
+  }
+});
+
+// POST /api/questionnaires/:id/sync-responses - Sync responses from Google Forms to database
+router.post('/:id/sync-responses', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+  const userId = req.user.id;
+
+  console.log('=== Sync Responses ===');
+  console.log('Questionnaire ID:', questionnaireId);
+  console.log('User ID:', userId);
+
+  let syncLogId;
+
+  try {
+    // Create sync log
+    syncLogId = await FormResponse.createSyncLog(questionnaireId, 'manual');
+
+    // 1. Get the Google Form ID from database
+    const [questionnaireRows] = await db.execute(
+      'SELECT google_form_id, google_form_url, title FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+
+    if (questionnaireRows.length === 0) {
+      await FormResponse.updateSyncLog(syncLogId, {
+        status: 'failed',
+        error: 'Questionnaire not found',
+        fetched: 0,
+        new: 0,
+        updated: 0,
+        failed: 0
+      });
+      return res.status(404).json({ message: 'Questionnaire not found' });
+    }
+
+    const questionnaire = questionnaireRows[0];
+
+    if (!questionnaire.google_form_id) {
+      await FormResponse.updateSyncLog(syncLogId, {
+        status: 'failed',
+        error: 'Not converted to Google Form',
+        fetched: 0,
+        new: 0,
+        updated: 0,
+        failed: 0
+      });
+      return res.status(400).json({ message: 'This questionnaire has not been converted to a Google Form yet' });
+    }
+
+    // 2. Get user's Google OAuth token
+    const [tokens] = await db.execute(
+      'SELECT access_token, refresh_token, expiry_date FROM oauth_tokens WHERE user_id = ?',
+      [userId]
+    );
+
+    if (tokens.length === 0) {
+      await FormResponse.updateSyncLog(syncLogId, {
+        status: 'failed',
+        error: 'Google authentication required',
+        fetched: 0,
+        new: 0,
+        updated: 0,
+        failed: 0
+      });
+      return res.status(401).json({ message: 'Google authentication required' });
+    }
+
+    const tokenData = tokens[0];
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expiry_date: tokenData.expiry_date
+    });
+
+    // 3. Fetch responses from Google Forms API
+    const forms = google.forms({ version: 'v1', auth: oauth2Client });
+
+    const responsesData = await forms.forms.responses.list({
+      formId: questionnaire.google_form_id
+    });
+
+    const googleResponses = responsesData.data.responses || [];
+
+    console.log(`Fetched ${googleResponses.length} responses from Google Forms`);
+
+    // 4. Save responses to database
+    let newCount = 0;
+    let updatedCount = 0;
+    let failedCount = 0;
+
+    for (const response of googleResponses) {
+      try {
+        const exists = await FormResponse.existsByGoogleResponseId(response.responseId);
+        await FormResponse.saveGoogleFormResponse(response, questionnaireId);
+
+        if (exists) {
+          updatedCount++;
+        } else {
+          newCount++;
+        }
+      } catch (error) {
+        console.error('Failed to save response:', response.responseId, error);
+        failedCount++;
+      }
+    }
+
+    // 5. Update questionnaire sync info
+    await FormResponse.updateQuestionnaireSyncInfo(questionnaireId, googleResponses.length);
+
+    // 6. Update sync log
+    await FormResponse.updateSyncLog(syncLogId, {
+      status: failedCount > 0 ? 'partial' : 'completed',
+      fetched: googleResponses.length,
+      new: newCount,
+      updated: updatedCount,
+      failed: failedCount
+    });
+
+    console.log(`Sync completed: ${newCount} new, ${updatedCount} updated, ${failedCount} failed`);
+
+    res.json({
+      message: 'Responses synced successfully',
+      summary: {
+        fetched: googleResponses.length,
+        new: newCount,
+        updated: updatedCount,
+        failed: failedCount,
+        total: googleResponses.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Sync failed:', error);
+
+    if (syncLogId) {
+      await FormResponse.updateSyncLog(syncLogId, {
+        status: 'failed',
+        error: error.message,
+        fetched: 0,
+        new: 0,
+        updated: 0,
+        failed: 0
+      });
+    }
+
+    res.status(500).json({ message: 'Failed to sync responses: ' + error.message });
+  }
+});
+
+// POST /api/questionnaires/:id/export-to-sheets - Export responses to Google Sheets
+router.post('/:id/export-to-sheets', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+  const userId = req.user.id;
+
+  console.log('=== Export to Google Sheets ===');
+  console.log('Questionnaire ID:', questionnaireId);
+
+  try {
+    // 1. Get questionnaire
+    const [questionnaireRows] = await db.execute(
+      'SELECT * FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+
+    if (questionnaireRows.length === 0) {
+      return res.status(404).json({ message: 'Questionnaire not found' });
+    }
+
+    const questionnaire = questionnaireRows[0];
+
+    // 2. Get questions
+    const [questions] = await db.execute(
+      'SELECT * FROM questionnaire_questions WHERE questionnaire_id = ? ORDER BY order_index ASC',
+      [questionnaireId]
+    );
+
+    if (questions.length === 0) {
+      return res.status(400).json({ message: 'No questions found for this questionnaire' });
+    }
+
+    // 3. Get responses from database
+    const responses = await FormResponse.findByQuestionnaireId(questionnaireId);
+
+    if (responses.length === 0) {
+      return res.status(400).json({ message: 'No responses to export. Please sync responses first.' });
+    }
+
+    // 4. Get user's Google OAuth token
+    const [tokens] = await db.execute(
+      'SELECT access_token, refresh_token, expiry_date FROM oauth_tokens WHERE user_id = ?',
+      [userId]
+    );
+
+    if (tokens.length === 0) {
+      return res.status(401).json({ message: 'Google authentication required' });
+    }
+
+    const tokenData = tokens[0];
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expiry_date: tokenData.expiry_date
+    });
+
+    // 5. Create Google Sheet
+    const sheetsService = new SheetsService(oauth2Client);
+    const sheetInfo = await sheetsService.exportResponsesToSheet(questionnaire, questions, responses);
+
+    // 6. Update questionnaire with sheet URL
+    await db.execute(
+      'UPDATE questionnaire_responses SET google_sheet_url = ? WHERE questionnaire_id = ?',
+      [sheetInfo.spreadsheetUrl, questionnaireId]
+    );
+
+    console.log('Export completed:', sheetInfo.spreadsheetUrl);
+
+    res.json({
+      message: 'Responses exported to Google Sheets successfully',
+      spreadsheetId: sheetInfo.spreadsheetId,
+      spreadsheetUrl: sheetInfo.spreadsheetUrl,
+      totalResponses: responses.length
+    });
+
+  } catch (error) {
+    console.error('Export failed:', error);
+    res.status(500).json({ message: 'Failed to export to Google Sheets: ' + error.message });
+  }
+});
+
+// GET /api/questionnaires/:id/sync-status - Get sync status and statistics
+router.get('/:id/sync-status', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+
+  try {
+    // Get questionnaire info
+    const [questionnaireRows] = await db.execute(
+      'SELECT last_synced_at, total_responses, google_form_id FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+
+    if (questionnaireRows.length === 0) {
+      return res.status(404).json({ message: 'Questionnaire not found' });
+    }
+
+    const questionnaire = questionnaireRows[0];
+
+    // Get response stats
+    const stats = await FormResponse.getResponseStats(questionnaireId);
+
+    // Get recent sync logs
+    const syncLogs = await FormResponse.getSyncLogs(questionnaireId, 5);
+
+    res.json({
+      hasGoogleForm: !!questionnaire.google_form_id,
+      lastSyncedAt: questionnaire.last_synced_at,
+      totalResponses: questionnaire.total_responses,
+      stats: stats,
+      recentSyncs: syncLogs
+    });
+
+  } catch (error) {
+    console.error('Failed to get sync status:', error);
+    res.status(500).json({ message: 'Failed to get sync status' });
+  }
 });
 
 export default router;
