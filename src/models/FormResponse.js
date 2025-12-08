@@ -16,25 +16,30 @@ export class FormResponse {
         const id = uuidv4();
         const googleResponseId = responseData.responseId;
 
+        // Extract respondent email if available
+        const respondentEmail = responseData.respondentEmail || null;
+
         // Parse answers from Google Forms format to simple key-value pairs
         const answers = this.parseGoogleFormAnswers(responseData.answers);
 
         try {
             await pool.execute(
                 `INSERT INTO questionnaire_responses 
-        (id, google_response_id, questionnaire_id, responder_id, answers, response_data, synced_at, sync_status) 
-        VALUES (?, ?, ?, ?, ?, ?, NOW(), 'synced')
+        (id, google_response_id, questionnaire_id, respondent_id, respondent_email, answers, response_data, synced_at, sync_status) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'synced')
         ON DUPLICATE KEY UPDATE 
+        respondent_email = VALUES(respondent_email),
         answers = VALUES(answers),
         response_data = VALUES(response_data),
         synced_at = NOW(),
         sync_status = 'synced'`,
-                [id, googleResponseId, questionnaireId, null, JSON.stringify(answers), JSON.stringify(responseData)]
+                [id, googleResponseId, questionnaireId, null, respondentEmail, JSON.stringify(answers), JSON.stringify(responseData)]
             );
 
             return id;
         } catch (error) {
             console.error('Error saving response:', error);
+            console.error('Response data:', { id, googleResponseId, questionnaireId, respondentEmail, answers: JSON.stringify(answers).substring(0, 100) });
             throw error;
         }
     }

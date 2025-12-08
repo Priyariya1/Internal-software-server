@@ -85,6 +85,23 @@ router.get('/forms', authenticateToken, requireRole(['admin', 'manager']), async
   }
 });
 
+// GET /api/questionnaires/:id/questions - Get questions for a questionnaire
+router.get('/:id/questions', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+
+  try {
+    const [questions] = await db.execute(
+      'SELECT id, question_text, question_type, options, order_index FROM questionnaire_questions WHERE questionnaire_id = ? ORDER BY order_index ASC',
+      [questionnaireId]
+    );
+
+    res.json({ questions });
+  } catch (error) {
+    console.error('Failed to fetch questions:', error);
+    res.status(500).json({ message: 'Failed to fetch questions.' });
+  }
+});
+
 
 /**
  * POST /api/questionnaires/forms - Create a New Questionnaire
@@ -319,11 +336,108 @@ router.post('/:id/convert', authenticateToken, requireRole(['admin', 'manager'])
   }
 });
 
-
-
 // Existing endpoints (placeholders for other functionality)
 router.get('/responses', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
   res.json({ items: [] });
+});
+
+// DELETE /api/questionnaires/:id - Delete a questionnaire and all its data
+router.delete('/:id', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const questionnaireId = req.params.id;
+
+  try {
+    // 1. Check if questionnaire exists
+    const [questionnaires] = await db.execute(
+      'SELECT id, title, google_form_id FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+
+    if (questionnaires.length === 0) {
+      return res.status(404).json({ message: 'Questionnaire not found' });
+    }
+
+    const questionnaire = questionnaires[0];
+
+    // 2. Delete all responses for this questionnaire
+    await FormResponse.deleteByQuestionnaireId(questionnaireId);
+
+    // 3. Delete all questions
+    await db.execute(
+      'DELETE FROM questionnaire_questions WHERE questionnaire_id = ?',
+      [questionnaireId]
+    );
+
+    // 4. Delete sync logs
+    await db.execute(
+      'DELETE FROM questionnaire_sync_logs WHERE questionnaire_id = ?',
+      [questionnaireId]
+    );
+
+    // 5. Delete the questionnaire itself
+    await db.execute(
+      'DELETE FROM questionnaires WHERE id = ?',
+      [questionnaireId]
+    );
+
+    console.log(`Deleted questionnaire: ${questionnaire.title} (${questionnaireId})`);
+
+    res.json({
+      message: 'Questionnaire deleted successfully',
+      deletedQuestionnaire: {
+        id: questionnaireId,
+        title: questionnaire.title
+      }
+    });
+  } catch (error) {
+    console.error('Failed to delete questionnaire:', error);
+    res.status(500).json({ message: 'Failed to delete questionnaire' });
+  }
+});
+
+// DELETE /api/questionnaires/responses/:responseId - Delete a single response
+router.delete('/responses/:responseId', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
+  const responseId = req.params.responseId;
+
+  try {
+    // Check if response exists
+    const [responses] = await db.execute(
+      'SELECT id, questionnaire_id FROM questionnaire_responses WHERE id = ?',
+      [responseId]
+    );
+
+    if (responses.length === 0) {
+      return res.status(404).json({ message: 'Response not found' });
+    }
+
+    const questionnaireId = responses[0].questionnaire_id;
+
+    // Delete the response
+    await db.execute(
+      'DELETE FROM questionnaire_responses WHERE id = ?',
+      [responseId]
+    );
+
+    // Update questionnaire total_responses count
+    const [countResult] = await db.execute(
+      'SELECT COUNT(*) as count FROM questionnaire_responses WHERE questionnaire_id = ?',
+      [questionnaireId]
+    );
+
+    await db.execute(
+      'UPDATE questionnaires SET total_responses = ? WHERE id = ?',
+      [countResult[0].count, questionnaireId]
+    );
+
+    console.log(`Deleted response: ${responseId}`);
+
+    res.json({
+      message: 'Response deleted successfully',
+      deletedResponseId: responseId
+    });
+  } catch (error) {
+    console.error('Failed to delete response:', error);
+    res.status(500).json({ message: 'Failed to delete response' });
+  }
 });
 
 router.post('/assign', authenticateToken, requireRole(['admin', 'manager']), async (req, res) => {
@@ -511,7 +625,6 @@ router.post('/:id/sync-responses', authenticateToken, requireRole(['admin', 'man
     let newCount = 0;
     let updatedCount = 0;
     let failedCount = 0;
-
     for (const response of googleResponses) {
       try {
         const exists = await FormResponse.existsByGoogleResponseId(response.responseId);
@@ -523,7 +636,9 @@ router.post('/:id/sync-responses', authenticateToken, requireRole(['admin', 'man
           newCount++;
         }
       } catch (error) {
-        console.error('Failed to save response:', response.responseId, error);
+        console.error('Failed to save response:', response.responseId);
+        console.error('Error details:', error.message);
+        console.error('Response structure:', JSON.stringify(response).substring(0, 200));
         failedCount++;
       }
     }

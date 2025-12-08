@@ -177,7 +177,6 @@ router.put('/me', authenticateToken, async (req, res) => {
   }
 });
 
-// This route is fine as is
 router.post('/logout', authenticateToken, (req, res) => {
   res.json({ message: 'Logged out successfully' });
 });
