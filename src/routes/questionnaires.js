@@ -228,7 +228,6 @@ router.post('/:id/convert', authenticateToken, requireRole(['admin', 'manager'])
       });
     }
     // Add questions
-
     for (const q of questions) {
       const item = {
         createItem: {
@@ -253,7 +252,6 @@ router.post('/:id/convert', authenticateToken, requireRole(['admin', 'manager'])
         let options = [];
         if (q.options) {
           if (Array.isArray(q.options)) {
-            // Already an array
             options = q.options;
           } else if (typeof q.options === 'string') {
             try {
